@@ -956,6 +956,10 @@ class RLOOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+        # SuperRL: apply weight-residency plan so new weights land in the right tier.
+        from ..extras.vllm_offload import apply_residency_after_weight_sync
+        apply_residency_after_weight_sync(self)
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -1143,6 +1147,10 @@ class RLOOTrainer(Trainer):
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
+            # SuperRL: prefetch offloaded layers back to HBM before generation.
+            from ..extras.vllm_offload import prefetch_before_rollout
+            prefetch_before_rollout(self)
+
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.vllm_mode == "server":
                 all_prompts_text = gather_object(prompts_text)
@@ -1249,6 +1257,10 @@ class RLOOTrainer(Trainer):
                     local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
                     tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
                     completion_ids = completion_ids[tp_slice]
+
+            # SuperRL: offload inactive layers back to DRAM after rollout.
+            from ..extras.vllm_offload import offload_after_rollout
+            offload_after_rollout(self)
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]

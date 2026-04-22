@@ -350,6 +350,8 @@ class GRPOTrainer(Trainer):
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
         self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
+        # SuperRL weight-offload state
+        self._superrl_offload_plan: dict = {}  # populated in _build_weight_residency_plan()
         self.use_liger_loss = args.use_liger_loss
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
@@ -970,6 +972,10 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+        # SuperRL: apply weight-residency plan so new weights land in the right tier.
+        from ..extras.vllm_offload import apply_residency_after_weight_sync
+        apply_residency_after_weight_sync(self)
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -1157,6 +1163,10 @@ class GRPOTrainer(Trainer):
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
                 self.llm.wake_up()
 
+            # SuperRL: prefetch offloaded layers back to HBM before generation.
+            from ..extras.vllm_offload import prefetch_before_rollout
+            prefetch_before_rollout(self)
+
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
@@ -1279,6 +1289,10 @@ class GRPOTrainer(Trainer):
 
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
+
+                # SuperRL: offload inactive layers back to DRAM after rollout.
+                from ..extras.vllm_offload import offload_after_rollout
+                offload_after_rollout(self)
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]

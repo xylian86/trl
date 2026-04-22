@@ -724,11 +724,18 @@ class OnlineDPOTrainer(Trainer):
         eos_token_id = self.eos_token_id
         pad_token_id = self.pad_token_id
 
+        # SuperRL: prefetch offloaded layers back to HBM before generation.
+        from ..extras.vllm_offload import prefetch_before_rollout, offload_after_rollout
+        prefetch_before_rollout(self)
+
         # Generate completion_ids and prompt_ids based on mode
         if self.vllm_mode == "server":
             completion_ids, prompt_ids = self._generate_vllm_server(prompts, images)
         elif self.vllm_mode == "colocate":
             completion_ids, prompt_ids = self._generate_vllm_colocate(prompts, images)
+
+        # SuperRL: offload inactive layers back to DRAM after rollout.
+        offload_after_rollout(self)
 
         # Shared padding, masking, and tensor conversion logic
         max_prompt_length = max(len(ids) for ids in prompt_ids)
@@ -925,6 +932,10 @@ class OnlineDPOTrainer(Trainer):
             self.vllm_client.reset_prefix_cache()
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
+
+        # SuperRL: apply weight-residency plan so new weights land in the right tier.
+        from ..extras.vllm_offload import apply_residency_after_weight_sync
+        apply_residency_after_weight_sync(self)
 
     def _sync_fsdp1_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""

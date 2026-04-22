@@ -381,6 +381,45 @@ class VLLMClient:
             if response.status_code != 200:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
+    # ------------------------------------------------------------------
+    # SuperRL weight-offload methods
+    # ------------------------------------------------------------------
+
+    def sleep(self) -> None:
+        """Put the vLLM server to sleep, freeing KV-cache memory."""
+        url = f"{self.base_url}/sleep/"
+        response = self.session.post(url)
+        if response.status_code != 200:
+            raise Exception(f"sleep request failed: {response.status_code}, {response.text}")
+
+    def wake_up(self) -> None:
+        """Wake the vLLM server from sleep."""
+        url = f"{self.base_url}/wake_up/"
+        response = self.session.post(url)
+        if response.status_code != 200:
+            raise Exception(f"wake_up request failed: {response.status_code}, {response.text}")
+
+    def offload_layers(self, layer_names: list) -> None:
+        """Offload listed transformer layer prefixes from HBM to DRAM."""
+        url = f"{self.base_url}/offload_layers/"
+        response = self.session.post(url, json={"layer_names": layer_names})
+        if response.status_code != 200:
+            raise Exception(f"offload_layers failed: {response.status_code}, {response.text}")
+
+    def prefetch_layers(self, layer_names: list) -> None:
+        """Prefetch previously offloaded layers back to HBM."""
+        url = f"{self.base_url}/prefetch_layers/"
+        response = self.session.post(url, json={"layer_names": layer_names})
+        if response.status_code != 200:
+            raise Exception(f"prefetch_layers failed: {response.status_code}, {response.text}")
+
+    def set_weight_residency(self, plan: dict) -> None:
+        """Apply a layer-name -> 'hbm'|'dram' residency plan atomically."""
+        url = f"{self.base_url}/set_weight_residency/"
+        response = self.session.post(url, json={"plan": plan})
+        if response.status_code != 200:
+            raise Exception(f"set_weight_residency failed: {response.status_code}, {response.text}")
+
 
 # Example usage
 if __name__ == "__main__":

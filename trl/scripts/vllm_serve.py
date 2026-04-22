@@ -30,6 +30,7 @@ import torch.distributed.distributed_c10d as c10d
 from transformers import is_torch_xpu_available, is_vision_available
 
 from trl import TrlParser
+from trl.extras.vllm_worker_extension import SuperRLWorkerExtension
 from trl.import_utils import (
     is_fastapi_available,
     is_pydantic_available,
@@ -75,7 +76,7 @@ logger = logging.getLogger(__name__)
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
-class WeightSyncWorkerExtension:
+class WeightSyncWorkerExtension(SuperRLWorkerExtension):
     """
     A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
 
@@ -83,6 +84,9 @@ class WeightSyncWorkerExtension:
     `ProcessGroupXCCL` to handle efficient GPU-based communication using NCCL. The primary purpose of this class is to
     receive updated model weights from a client process and distribute them to all worker processes participating in
     model inference.
+
+    Inherits SuperRL per-layer weight offload RPCs (offload_layers / prefetch_layers /
+    set_weight_residency / superrl_residency_stats) from `SuperRLWorkerExtension`.
     """
 
     # The following attributes are initialized when `init_communicator` method is called.
@@ -184,6 +188,10 @@ class WeightSyncWorkerExtension:
             del self.communicator
             self.communicator = None  # Ensure attribute is reset to None
             self.client_rank = None  # Ensure attribute is reset to None
+
+    # SuperRL weight-offload RPCs (offload_layers / prefetch_layers /
+    # set_weight_residency / superrl_residency_stats) come from the
+    # SuperRLWorkerExtension mixin imported above.
 
 
 @dataclass
@@ -686,6 +694,53 @@ def main(script_args: ScriptArguments):
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
         return {"message": "Request received, closing communicator"}
+
+    # ------------------------------------------------------------------
+    # SuperRL weight-offload routes
+    # ------------------------------------------------------------------
+
+    @app.post("/sleep/")
+    async def sleep_vllm():
+        """Put the vLLM engine to sleep (free KV cache / GPU memory)."""
+        kwargs = {"method": "sleep", "args": [1]}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": "Request received, sleeping vLLM"}
+
+    @app.post("/wake_up/")
+    async def wake_up_vllm():
+        """Wake the vLLM engine from sleep."""
+        kwargs = {"method": "wake_up"}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": "Request received, waking vLLM"}
+
+    @app.post("/offload_layers/")
+    async def offload_layers(request: dict):
+        """Offload listed transformer layers to host DRAM."""
+        layer_names = request.get("layer_names", [])
+        kwargs = {"method": "offload_layers", "args": [layer_names]}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": f"Offloading {len(layer_names)} layer(s)"}
+
+    @app.post("/prefetch_layers/")
+    async def prefetch_layers(request: dict):
+        """Restore offloaded layers back to HBM."""
+        layer_names = request.get("layer_names", [])
+        kwargs = {"method": "prefetch_layers", "args": [layer_names]}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": f"Prefetching {len(layer_names)} layer(s)"}
+
+    @app.post("/set_weight_residency/")
+    async def set_weight_residency(request: dict):
+        """Apply a layer-name -> hbm|dram residency plan atomically."""
+        plan = request.get("plan", {})
+        kwargs = {"method": "set_weight_residency", "args": [plan]}
+        for connection in connections:
+            connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        return {"message": "Residency plan applied"}
 
     # Start the server
     uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)

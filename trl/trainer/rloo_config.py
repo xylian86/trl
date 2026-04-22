@@ -535,6 +535,32 @@ class RLOOConfig(TrainingArguments):
             "after the timeout, a `ConnectionError` is raised."
         },
     )
+    vllm_weight_offload: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "SuperRL: whether to offload inactive vLLM policy layers to Grace DRAM (host memory) between "
+                "rollouts, freeing HBM for KV cache.  On GH200 the restore path uses NVLink-C2C.  "
+                "Requires vllm_mode='server' or 'colocate'."
+            )
+        },
+    )
+    vllm_weight_offload_active_layers: float = field(
+        default=0.25,
+        metadata={
+            "help": (
+                "Fraction (0 < f <= 1.0) or absolute count (int >= 1) of transformer layers kept in HBM "
+                "during rollout generation when vllm_weight_offload=True.  The remaining layers are "
+                "offloaded to DRAM.  Deeper layers (closer to output) are preferred for HBM residency."
+            )
+        },
+    )
+    vllm_weight_offload_use_c2c: bool = field(
+        default=True,
+        metadata={
+            "help": "Use NVLink-C2C for the DRAM->HBM prefetch path on GH200.  Has no effect on PCIe-only nodes."
+        },
+    )
 
     # Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
     vllm_gpu_memory_utilization: float = field(
