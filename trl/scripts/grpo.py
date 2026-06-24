@@ -140,10 +140,11 @@ def main(script_args, training_args, model_args, dataset_args):
     # Train the model
     trainer.train()
 
-    # Save and push to Hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    # Save and push to Hub unless checkpointing is disabled.
+    if training_args.save_strategy != "no":
+        trainer.save_model(training_args.output_dir)
+        if training_args.push_to_hub:
+            trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
 
 def make_parser(subparsers: argparse._SubParsersAction = None):
