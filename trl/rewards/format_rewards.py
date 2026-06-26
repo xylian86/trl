@@ -45,6 +45,8 @@ def think_format_reward(completions: list[list[dict[str, str]]], **kwargs) -> li
     ```
     """
     pattern = r"^<think>(?!.*<think>)(.*?)</think>.*$"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [
+        completion if isinstance(completion, str) else completion[0]["content"] for completion in completions
+    ]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
