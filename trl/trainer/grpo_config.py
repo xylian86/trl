@@ -140,6 +140,9 @@ class GRPOConfig(TrainingArguments):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
+        vllm_cpu_offload_gb (`float`, *optional*, defaults to `0.0`):
+            CPU memory in GiB to use for vLLM weight offloading. This reduces rollout GPU memory pressure at the cost
+            of PCIe/NVLink traffic during generation. In server mode, pass this separately to the vLLM server.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for vLLM. If `True`, vLLM will sleep during the optimization step and woken
             for weight sync and generation.
@@ -472,6 +475,13 @@ class GRPOConfig(TrainingArguments):
             "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
             "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
             "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
+    )
+    vllm_cpu_offload_gb: float = field(
+        default=0.0,
+        metadata={
+            "help": "CPU memory in GiB to use for vLLM weight offloading. This setting only applies directly when "
+            "`vllm_mode='colocate'`; in server mode, pass it to the vLLM server via `--cpu_offload_gb`."
         },
     )
 

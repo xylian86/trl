@@ -188,6 +188,8 @@ class ScriptArguments:
             device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
             improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
             during initialization.
+        cpu_offload_gb (`float`, *optional*, defaults to `0.0`):
+            CPU memory in GiB to use for vLLM weight offloading.
         dtype (`str`, *optional*, defaults to `"auto"`):
             Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
             based on the model configuration. Find the supported values in the vLLM documentation.
@@ -246,6 +248,10 @@ class ScriptArguments:
             "size and thus improve the model's throughput. However, if the value is too high, it may cause "
             "out-of-memory (OOM) errors during initialization."
         },
+    )
+    cpu_offload_gb: float = field(
+        default=0.0,
+        metadata={"help": "CPU memory in GiB to use for vLLM weight offloading."},
     )
     dtype: str = field(
         default="auto",
@@ -321,6 +327,7 @@ def llm_worker(
         revision=script_args.revision,
         tensor_parallel_size=script_args.tensor_parallel_size,
         gpu_memory_utilization=script_args.gpu_memory_utilization,
+        cpu_offload_gb=script_args.cpu_offload_gb,
         enforce_eager=script_args.enforce_eager,
         dtype=script_args.dtype,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
