@@ -298,11 +298,14 @@ def add_hooks(model: "DeepSpeedEngine") -> None:
         optimizer_offload = model.optimizer
     else:
         raise RuntimeError("The model optimizer is None, which is not yet supported.")
-    if version.parse(deepspeed.__version__) >= version.parse("0.16.4"):
+    if hasattr(optimizer_offload, "_register_deepspeed_module"):
         # Account for renaming in https://github.com/deepspeedai/DeepSpeed/pull/6847
+        # Some DeepSpeed forks backport this method without bumping __version__.
         optimizer_offload._register_deepspeed_module(optimizer_offload.module)
-    else:
+    elif hasattr(optimizer_offload, "_register_hooks_recursively"):
         optimizer_offload._register_hooks_recursively(optimizer_offload.module)
+    else:
+        raise AttributeError("DeepSpeed ZeRO-3 offload hook registration method not found.")
 
 
 @contextmanager
