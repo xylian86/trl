@@ -210,6 +210,8 @@ class PPOTrainer(Trainer):
 
         if ref_model:
             self.ref_model = ref_model
+        elif args.kl_coef == 0.0:
+            self.ref_model = None
         elif self.is_peft_model:
             self.ref_model = None
         else:
@@ -332,7 +334,7 @@ class PPOTrainer(Trainer):
             )
 
             if self.ref_model is None:
-                if not self.is_peft_model:
+                if not self.is_peft_model and args.kl_coef != 0.0:
                     raise ValueError("No reference model and model is not a Peft model.")
             else:
                 self.ref_model = prepare_deepspeed(
@@ -340,7 +342,7 @@ class PPOTrainer(Trainer):
                 )
         else:
             if self.ref_model is None:
-                if not self.is_peft_model:
+                if not self.is_peft_model and args.kl_coef != 0.0:
                     raise ValueError("No reference model and model is not a Peft model.")
             else:
                 self.ref_model = self.ref_model.to(self.accelerator.device)
@@ -478,15 +480,21 @@ class PPOTrainer(Trainer):
                     del logits
                     empty_cache()
 
-                    if ref_policy is None:
+                    if args.kl_coef == 0.0:
+                        ref_logprob = logprob.detach().clone()
+                    elif ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
+                        ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        ref_logits /= args.temperature + 1e-7
+                        ref_logprob = selective_log_softmax(ref_logits, response)
+                        del ref_output, ref_logits
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                    ref_logits /= args.temperature + 1e-7
-                    ref_logprob = selective_log_softmax(ref_logits, response)
-                    del ref_output, ref_logits
+                        ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        ref_logits /= args.temperature + 1e-7
+                        ref_logprob = selective_log_softmax(ref_logits, response)
+                        del ref_output, ref_logits
                     empty_cache()
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
