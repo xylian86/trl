@@ -110,6 +110,69 @@ class TestPPOTrainer(TrlTestCase):
         self.assertTrue(critic_weights_updated, "Critic weights were not updated during training")
         self.assertTrue(policy_weights_updated, "Policy weights were not updated during training")
 
+    def test_zero_kl_ignores_supplied_reference_model(self):
+        training_args = PPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=2,
+            total_episodes=4,
+            num_ppo_epochs=1,
+            num_mini_batches=1,
+            local_rollout_forward_batch_size=1,
+            response_length=4,
+            num_sample_generations=0,
+            kl_coef=0.0,
+            save_strategy="no",
+            report_to="none",
+        )
+
+        trainer = PPOTrainer(
+            args=training_args,
+            processing_class=self.tokenizer,
+            model=self.model,
+            ref_model=self.ref_model,
+            reward_model=self.reward_model,
+            value_model=self.value_model,
+            train_dataset=self.raw_dataset["train"],
+            eval_dataset=self.raw_dataset["test"],
+        )
+
+        self.assertIsNone(trainer.ref_model)
+        trainer.train()
+
+    def test_nonzero_kl_uses_reference_model(self):
+        training_args = PPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=2,
+            total_episodes=4,
+            num_ppo_epochs=1,
+            num_mini_batches=1,
+            local_rollout_forward_batch_size=1,
+            response_length=4,
+            num_sample_generations=0,
+            kl_coef=0.05,
+            save_strategy="no",
+            report_to="none",
+        )
+
+        trainer = PPOTrainer(
+            args=training_args,
+            processing_class=self.tokenizer,
+            model=self.model,
+            ref_model=self.ref_model,
+            reward_model=self.reward_model,
+            value_model=self.value_model,
+            train_dataset=self.raw_dataset["train"],
+            eval_dataset=self.raw_dataset["test"],
+        )
+
+        self.assertIsNotNone(trainer.ref_model)
+        trainer.train()
+        kl_values = [entry["objective/kl"] for entry in trainer.state.log_history if "objective/kl" in entry]
+        self.assertTrue(kl_values)
+        self.assertGreater(kl_values[-1], 0.0)
+
     @require_peft
     def test_peft_training(self):
         """Test PPO training with PEFT configuration and verify model updates."""

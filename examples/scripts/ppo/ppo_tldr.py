@@ -43,6 +43,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
+from trl.trainer.ppo_trainer import is_reference_model_required
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 
@@ -126,7 +127,7 @@ if __name__ == "__main__":
     )
 
     peft_config = get_peft_config(model_args)
-    if peft_config is None:
+    if is_reference_model_required(training_args.kl_coef, peft_config):
         ref_policy = AutoModelForCausalLM.from_pretrained(
             training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
         )

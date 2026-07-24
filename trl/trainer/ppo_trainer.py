@@ -81,6 +81,11 @@ if is_wandb_available():
 INVALID_LOGPROB = 1.0
 
 
+def is_reference_model_required(kl_coef: float, peft_config=None) -> bool:
+    """Return whether PPO needs a separately loaded reference policy."""
+    return kl_coef != 0.0 and peft_config is None
+
+
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
@@ -111,7 +116,8 @@ class PPOTrainer(Trainer):
         model (`torch.nn.Module`):
             Model to be trained. This is the policy model.
         ref_model (`torch.nn.Module`, *optional*):
-            Reference model used to compute the KL divergence. If `None`, a copy of the policy model is created.
+            Reference model used to compute the KL divergence. If `None`, a copy of the policy model is created unless
+            `args.kl_coef` is zero. Any supplied reference model is ignored when `args.kl_coef` is zero.
         reward_model (`torch.nn.Module`):
             Reward model used to compute the rewards.
         train_dataset ([`~datasets.Dataset`]):
@@ -154,7 +160,7 @@ class PPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         peft_config: Optional["PeftConfig"] = None,
     ) -> None:
-        if ref_model is model:
+        if args.kl_coef != 0.0 and ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must make a copy of it, or `None` if you use peft."
@@ -208,10 +214,10 @@ class PPOTrainer(Trainer):
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
 
-        if ref_model:
-            self.ref_model = ref_model
-        elif args.kl_coef == 0.0:
+        if args.kl_coef == 0.0:
             self.ref_model = None
+        elif ref_model is not None:
+            self.ref_model = ref_model
         elif self.is_peft_model:
             self.ref_model = None
         else:
@@ -456,7 +462,7 @@ class PPOTrainer(Trainer):
                 responses = []
                 postprocessed_responses = []
                 logprobs = []
-                ref_logprobs = []
+                ref_logprobs = None if args.kl_coef == 0.0 else []
                 scores = []
                 sequence_lengths = []
                 values = []
@@ -481,7 +487,7 @@ class PPOTrainer(Trainer):
                     empty_cache()
 
                     if args.kl_coef == 0.0:
-                        ref_logprob = logprob.detach().clone()
+                        ref_logprob = None
                     elif ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
@@ -519,14 +525,16 @@ class PPOTrainer(Trainer):
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
                     logprobs.append(logprob)
-                    ref_logprobs.append(ref_logprob)
+                    if ref_logprobs is not None:
+                        ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
-                ref_logprobs = torch.cat(ref_logprobs, 0)
+                if ref_logprobs is not None:
+                    ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
@@ -545,7 +553,10 @@ class PPOTrainer(Trainer):
                 response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+                if ref_logprobs is None:
+                    ref_logprobs = logprobs.detach()
+                else:
+                    ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
