@@ -17,6 +17,7 @@ import inspect
 import os
 import re
 import textwrap
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from functools import partial
@@ -64,11 +65,13 @@ from .utils import (
     generate_model_card,
     get_comet_experiment_url,
     identity,
+    maybe_gather_lm_head_ctx,
     nanmax,
     nanmin,
     nanstd,
     pad,
     print_prompt_completions_sample,
+    reorder_sequence_dict,
     selective_log_softmax,
     shuffle_sequence_dict,
     split_pixel_values_by_grid,
@@ -97,6 +100,74 @@ logger = logging.get_logger(__name__)
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+_COMPLETION_ALIGNED_KEYS = {
+    "completion_ids",
+    "completion_mask",
+    "importance_sampling_ratio",
+    "old_per_token_logps",
+    "ref_per_token_logps",
+    "sampling_per_token_logps",
+    "tool_mask",
+}
+
+
+def _length_bucket_generation_batch(generation_batch, micro_batch_size, gradient_accumulation_steps):
+    """Sort by valid sequence length without moving samples across optimizer steps."""
+    prompt_lengths = generation_batch["prompt_mask"].sum(dim=1)
+    completion_lengths = generation_batch["completion_mask"].sum(dim=1)
+    sequence_lengths = prompt_lengths + completion_lengths
+    optimizer_batch_size = micro_batch_size * gradient_accumulation_steps
+    permutations = []
+    for start in range(0, len(sequence_lengths), optimizer_batch_size):
+        end = min(start + optimizer_batch_size, len(sequence_lengths))
+        local_order = torch.argsort(sequence_lengths[start:end], descending=True, stable=True)
+        permutations.append(local_order + start)
+    return reorder_sequence_dict(generation_batch, torch.cat(permutations))
+
+
+def _generation_padding_counts(generation_batch, micro_batch_size):
+    """Return valid and padded token counts after per-micro-batch trimming."""
+    prompt_lengths = generation_batch["prompt_mask"].sum(dim=1)
+    completion_lengths = generation_batch["completion_mask"].sum(dim=1)
+    valid_tokens = prompt_lengths.sum() + completion_lengths.sum()
+    padded_tokens = valid_tokens.new_zeros(())
+    for start in range(0, len(prompt_lengths), micro_batch_size):
+        end = min(start + micro_batch_size, len(prompt_lengths))
+        batch_size = end - start
+        padded_tokens += batch_size * (
+            prompt_lengths[start:end].max() + completion_lengths[start:end].max()
+        )
+    return valid_tokens, padded_tokens
+
+
+def _trim_generation_batch_padding(inputs):
+    """Remove columns that are padding for every sequence in a micro-batch."""
+    trimmed = dict(inputs)
+    prompt_mask = inputs["prompt_mask"]
+    prompt_columns = prompt_mask.bool().any(dim=0).nonzero(as_tuple=True)[0]
+    prompt_start = prompt_columns[0].item() if len(prompt_columns) else max(0, prompt_mask.shape[1] - 1)
+    for key in ("prompt_ids", "prompt_mask"):
+        trimmed[key] = inputs[key][:, prompt_start:]
+
+    completion_mask = inputs["completion_mask"]
+    completion_columns = completion_mask.bool().any(dim=0).nonzero(as_tuple=True)[0]
+    completion_end = completion_columns[-1].item() + 1 if len(completion_columns) else 1
+    completion_shape = completion_mask.shape
+    for key in _COMPLETION_ALIGNED_KEYS:
+        value = inputs.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[:2] == completion_shape:
+            trimmed[key] = value[:, :completion_end]
+    return trimmed
+
+
+def _load_processing_class(model_id):
+    try:
+        return AutoProcessor.from_pretrained(model_id)
+    except ValueError:
+        # Text-only causal LMs such as Llama expose a tokenizer but no
+        # AutoProcessor registration.
+        return AutoTokenizer.from_pretrained(model_id)
 
 
 class GRPOTrainer(Trainer):
@@ -263,7 +334,7 @@ class GRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(model.config._name_or_path)
+            processing_class = _load_processing_class(model_id)
 
         # Handle pad token for processors or tokenizers
         if isinstance(processing_class, ProcessorMixin):
@@ -388,6 +459,8 @@ class GRPOTrainer(Trainer):
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
+        self._timed_train_microsteps = 0
+        self._current_rl_step_time = 0.0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
@@ -444,11 +517,21 @@ class GRPOTrainer(Trainer):
                 raise ImportError(
                     "Liger is required to use `liger_loss` as the GRPO loss. Run `pip install liger-kernel`."
                 )
-            # redirect the model.module forward to the model forward to ensure pre-forward hooks are called
+            # Redirect through the wrapped model so ZeRO-3 can reduce the
+            # gathered LM-head gradient after the fused forward.
             self._forward_redirection = _ForwardRedirection()
+            self._lm_head_forward_redirection = _ForwardRedirection()
+            liger_loss_compile = args.liger_loss_compile
+            if liger_loss_compile is None:
+                liger_loss_compile = not args.generation_batch_length_bucketing
+            if args.generation_batch_length_bucketing and liger_loss_compile:
+                logger.warning(
+                    "Compiling Liger loss with generated-length bucketing can trigger shape-guard recompilation."
+                )
 
             self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
                 beta=self.beta,
+                compiled=liger_loss_compile,
                 epsilon_low=self.epsilon_low,
                 epsilon_high=self.epsilon_high,
                 temperature=self.temperature,
@@ -971,6 +1054,25 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    def _release_superrl_optimizer_buffers_for_rollout(self):
+        release_fn = getattr(self.model_wrapped, "release_superrl_optimizer_buffers", None)
+        if release_fn is None:
+            return 0
+        released_bytes = release_fn()
+        if released_bytes and self.accelerator.is_main_process:
+            logger.info(f"Released {released_bytes / (1024**3):.2f} GiB of SuperRL optimizer buffers for rollout")
+        return released_bytes
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        start_time = time.perf_counter()
+        output = super().training_step(model, inputs, num_items_in_batch)
+        self._current_rl_step_time += time.perf_counter() - start_time
+        self._timed_train_microsteps += 1
+        if self._timed_train_microsteps % self.current_gradient_accumulation_steps == 0:
+            self._metrics["train"]["step_time"].append(self._current_rl_step_time)
+            self._current_rl_step_time = 0.0
+        return output
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -996,9 +1098,34 @@ class GRPOTrainer(Trainer):
                 generation_batch = self._generate_and_score_completions(generation_batch)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
+                if self.args.generation_batch_length_bucketing:
+                    valid_tokens, padded_tokens_before = _generation_padding_counts(
+                        generation_batch, self.args.per_device_train_batch_size
+                    )
+                    generation_batch = _length_bucket_generation_batch(
+                        generation_batch,
+                        self.args.per_device_train_batch_size,
+                        self.args.gradient_accumulation_steps,
+                    )
+                    _, padded_tokens_after = _generation_padding_counts(
+                        generation_batch, self.args.per_device_train_batch_size
+                    )
+                    counts = torch.stack([valid_tokens, padded_tokens_before, padded_tokens_after])
+                    counts = self.accelerator.gather(counts).reshape(-1, 3).sum(dim=0).float()
+                    self._metrics[mode]["padding_efficiency/before"].append(
+                        (counts[0] / counts[1].clamp(min=1)).item()
+                    )
+                    self._metrics[mode]["padding_efficiency/after"].append(
+                        (counts[0] / counts[2].clamp(min=1)).item()
+                    )
+                    self._metrics[mode]["padding_tokens/saved_ratio"].append(
+                        (1 - counts[2] / counts[1].clamp(min=1)).item()
+                    )
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+            if self.args.generation_batch_length_bucketing:
+                inputs = _trim_generation_batch_padding(inputs)
             self._step += 1
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
@@ -1145,6 +1272,7 @@ class GRPOTrainer(Trainer):
         if self.use_vllm:
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
                 # wake up colocated vLLM instances if needed
+                self._release_superrl_optimizer_buffers_for_rollout()
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
                 self.llm.wake_up()
 
@@ -1570,6 +1698,23 @@ class GRPOTrainer(Trainer):
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
 
+    def _compute_liger_loss_from_hidden(self, lm_head, last_hidden_state, completion_ids, completion_mask, inputs):
+        lm_head_weight = lm_head.weight
+        lm_head_bias = lm_head.bias
+        with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
+            return self.liger_grpo_loss(
+                _input=last_hidden_state,
+                lin_weight=lm_head_weight,
+                selected_token_ids=completion_ids,
+                attention_mask=completion_mask,
+                advantages=inputs["advantages"],
+                bias=lm_head_bias,
+                old_per_token_logps=inputs.get("old_per_token_logps"),
+                ref_per_token_logps=inputs.get("ref_per_token_logps"),
+                vllm_is_ratio=inputs.get("importance_sampling_ratio"),
+                num_items_in_batch=inputs.get("num_items_in_batch"),
+            )
+
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -1590,16 +1735,19 @@ class GRPOTrainer(Trainer):
             inputs.get("image_sizes"),
         )
 
-        # compute loss and metrics using liger grpo loss
-        loss, metrics = self.liger_grpo_loss(
-            _input=last_hidden_state,
-            lin_weight=unwrapped_model.lm_head.weight,
-            selected_token_ids=completion_ids,
-            attention_mask=completion_mask,
-            advantages=inputs["advantages"],
-            bias=unwrapped_model.lm_head.bias,
-            old_per_token_logps=inputs.get("old_per_token_logps"),
-            ref_per_token_logps=inputs.get("ref_per_token_logps"),
+        # Invoke the fused operation through the head module so ZeRO-3's
+        # backward pre-hook regathers the weight before Liger returns its full
+        # gradient. The gather context handles versions that do not gather on
+        # the redirected module pre-hook.
+        loss, metrics = self._lm_head_forward_redirection(
+            unwrapped_model.lm_head,
+            unwrapped_model.lm_head,
+            self._compute_liger_loss_from_hidden,
+            unwrapped_model.lm_head,
+            last_hidden_state,
+            completion_ids,
+            completion_mask,
+            inputs,
         )
         # Extract metrics from the liger_grpo_loss output
         # KL divergence is the first metric when beta is non-zero
@@ -1610,7 +1758,10 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
-        return loss / self.current_gradient_accumulation_steps
+        # DAPO's global token count already normalizes the full accumulation
+        # window. Other loss types are normalized per micro-batch.
+        normalizer = 1 if self.loss_type == "dapo" else self.current_gradient_accumulation_steps
+        return loss / normalizer
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

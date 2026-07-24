@@ -70,6 +70,9 @@ class GRPOConfig(TrainingArguments):
         steps_per_generation: (`int` or `None`, *optional*, defaults to `None`):
             Number of steps per generation. If `None`, it defaults to `gradient_accumulation_steps`. Mutually exclusive
             with `generation_batch_size`.
+        generation_batch_length_bucketing (`bool`, *optional*, defaults to `False`):
+            Whether to group generated sequences with similar token lengths inside each optimizer step and trim
+            batch-wide padding before policy forward/backward.
         temperature (`float`, defaults to `1.0`):
             Temperature for sampling. The higher the temperature, the more random the completions.
         top_p (`float`, *optional*, defaults to `1.0`):
@@ -141,8 +144,8 @@ class GRPOConfig(TrainingArguments):
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
         vllm_cpu_offload_gb (`float`, *optional*, defaults to `0.0`):
-            CPU memory in GiB to use for vLLM weight offloading. This reduces rollout GPU memory pressure at the cost
-            of PCIe/NVLink traffic during generation. In server mode, pass this separately to the vLLM server.
+            CPU memory in GiB per GPU to use for vLLM weight offloading. This reduces rollout GPU memory pressure at
+            the cost of PCIe/NVLink traffic during generation. In server mode, pass this separately to the vLLM server.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for vLLM. If `True`, vLLM will sleep during the optimization step and woken
             for weight sync and generation.
@@ -223,6 +226,9 @@ class GRPOConfig(TrainingArguments):
             `mask_truncated_completions=True`, only tokens from non-truncated completions are considered.
         use_liger_loss (`bool`, *optional*, defaults to `False`):
             Whether to use the Liger GRPO loss.
+        liger_loss_compile (`bool` or `None`, *optional*, defaults to `None`):
+            Whether to compile Liger's loss-math subgraph. If unset, compilation is disabled for dynamic generated
+            length bucketing and enabled otherwise.
         vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
             Whether to apply Truncated Importance Sampling (TIS) between vLLM completion logprobs and recomputed
             logprobs. [Your Efficient RL Framework Secretly Brings You Off-Policy RL
@@ -342,6 +348,12 @@ class GRPOConfig(TrainingArguments):
     steps_per_generation: Optional[int] = field(
         default=None,
         metadata={"help": "Number of steps per generation. If `None`, it defaults to `gradient_accumulation_steps`."},
+    )
+    generation_batch_length_bucketing: bool = field(
+        default=False,
+        metadata={
+            "help": "Group generated sequences by token length inside each optimizer step and trim batch padding."
+        },
     )
     temperature: float = field(
         default=1.0,
@@ -480,7 +492,7 @@ class GRPOConfig(TrainingArguments):
     vllm_cpu_offload_gb: float = field(
         default=0.0,
         metadata={
-            "help": "CPU memory in GiB to use for vLLM weight offloading. This setting only applies directly when "
+            "help": "CPU memory in GiB per GPU to use for vLLM weight offloading. This setting only applies when "
             "`vllm_mode='colocate'`; in server mode, pass it to the vLLM server via `--cpu_offload_gb`."
         },
     )
@@ -608,6 +620,12 @@ class GRPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to use the Liger GRPO loss."},
     )
+    liger_loss_compile: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Compile Liger loss math. Defaults off for generated-length bucketing and on otherwise."
+        },
+    )
     vllm_importance_sampling_correction: bool = field(
         default=True,
         metadata={
@@ -647,6 +665,9 @@ class GRPOConfig(TrainingArguments):
     )
 
     def __post_init__(self):
+        if self.vllm_cpu_offload_gb < 0:
+            raise ValueError("vllm_cpu_offload_gb must be greater than or equal to 0")
+
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
         super().__post_init__()

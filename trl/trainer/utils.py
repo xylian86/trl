@@ -18,6 +18,7 @@ import json
 import random
 from collections import deque
 from collections.abc import Sequence, Sized
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from typing import Any, Literal, Optional, Union
@@ -535,6 +536,28 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
+
+
+def maybe_gather_lm_head_ctx(*params: torch.nn.Parameter):
+    """Gather ZeRO-3-partitioned LM-head parameters for a fused loss."""
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+    if not is_deepspeed_zero3_enabled():
+        return nullcontext()
+
+    import deepspeed
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+    # Deduplicate tied weights and do not disturb parameters already held by an
+    # active embedding module.
+    to_gather = {
+        id(param): param
+        for param in params
+        if param is not None and param.ds_status != ZeroParamStatus.AVAILABLE
+    }
+    if not to_gather:
+        return nullcontext()
+    return deepspeed.zero.GatheredParameters(list(to_gather.values()))
 
 
 def exact_div(a, b, custom_error_message=""):
@@ -1751,6 +1774,27 @@ def split_tensor_dict(
     return chunks
 
 
+def reorder_sequence_dict(
+    seq_dict: dict[str, Optional[Sequence]], permutation: torch.Tensor
+) -> dict[str, Optional[Sequence]]:
+    """Reorder sequence-like values along their first dimension in unison."""
+    batch_size = len(next(value for value in seq_dict.values() if value is not None))
+    if permutation.ndim != 1 or len(permutation) != batch_size:
+        raise ValueError(f"Expected a permutation of length {batch_size}, got shape {tuple(permutation.shape)}")
+    indices = permutation.tolist()
+
+    def permute(value: Optional[Sequence]) -> Optional[Sequence]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor) and value.ndim == 0:
+            return value
+        if isinstance(value, torch.Tensor):
+            return value.index_select(0, permutation.to(value.device))
+        return [value[index] for index in indices]
+
+    return {key: permute(value) for key, value in seq_dict.items()}
+
+
 def shuffle_sequence_dict(seq_dict: dict[str, Optional[Sequence]]) -> dict[str, Optional[Sequence]]:
     """
     Shuffles all sequence-like values in a dictionary along the first dimension in unison.
@@ -1767,20 +1811,8 @@ def shuffle_sequence_dict(seq_dict: dict[str, Optional[Sequence]]) -> dict[str, 
      'y': ['b', 'a', 'c']}
     ```
     """
-    # Determine batch size from the first non-None sequence
-    batch_size = len(next(v for v in seq_dict.values() if v is not None))
-    permutation = torch.randperm(batch_size)
-
-    def permute(v: Optional[Sequence]) -> Optional[Sequence]:
-        if v is None:
-            return None
-        if isinstance(v, torch.Tensor) and v.ndim == 0:
-            return v
-        if isinstance(v, torch.Tensor) and v.ndim >= 1:
-            return v[permutation]
-        return [v[i] for i in permutation]
-
-    return {key: permute(val) for key, val in seq_dict.items()}
+    batch_size = len(next(value for value in seq_dict.values() if value is not None))
+    return reorder_sequence_dict(seq_dict, torch.randperm(batch_size))
 
 
 def nanmin(tensor: torch.Tensor) -> torch.Tensor:
