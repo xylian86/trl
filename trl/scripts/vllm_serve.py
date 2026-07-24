@@ -189,7 +189,7 @@ class ScriptArguments:
             improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
             during initialization.
         cpu_offload_gb (`float`, *optional*, defaults to `0.0`):
-            CPU memory in GiB to use for vLLM weight offloading.
+            CPU memory in GiB per GPU to use for vLLM weight offloading.
         dtype (`str`, *optional*, defaults to `"auto"`):
             Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
             based on the model configuration. Find the supported values in the vLLM documentation.
@@ -251,7 +251,7 @@ class ScriptArguments:
     )
     cpu_offload_gb: float = field(
         default=0.0,
-        metadata={"help": "CPU memory in GiB to use for vLLM weight offloading."},
+        metadata={"help": "CPU memory in GiB per GPU to use for vLLM weight offloading."},
     )
     dtype: str = field(
         default="auto",
@@ -311,6 +311,10 @@ class ScriptArguments:
             "model implementation."
         },
     )
+
+    def __post_init__(self):
+        if self.cpu_offload_gb < 0:
+            raise ValueError("cpu_offload_gb must be greater than or equal to 0")
 
 
 def llm_worker(

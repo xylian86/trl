@@ -142,8 +142,8 @@ class RLOOConfig(TrainingArguments):
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
         vllm_cpu_offload_gb (`float`, *optional*, defaults to `0.0`):
-            CPU memory in GiB to use for vLLM weight offloading. This reduces rollout GPU memory pressure at the cost
-            of PCIe/NVLink traffic during generation. In server mode, pass this separately to the vLLM server.
+            CPU memory in GiB per GPU to use for vLLM weight offloading. This reduces rollout GPU memory pressure at
+            the cost of PCIe/NVLink traffic during generation. In server mode, pass this separately to the vLLM server.
 
         > Parameters that control the training
 
@@ -423,7 +423,7 @@ class RLOOConfig(TrainingArguments):
     vllm_cpu_offload_gb: float = field(
         default=0.0,
         metadata={
-            "help": "CPU memory in GiB to use for vLLM weight offloading. This setting only applies directly when "
+            "help": "CPU memory in GiB per GPU to use for vLLM weight offloading. This setting only applies when "
             "`vllm_mode='colocate'`; in server mode, pass it to the vLLM server via `--cpu_offload_gb`."
         },
     )
@@ -593,6 +593,9 @@ class RLOOConfig(TrainingArguments):
     )
 
     def __post_init__(self):
+        if self.vllm_cpu_offload_gb < 0:
+            raise ValueError("vllm_cpu_offload_gb must be greater than or equal to 0")
+
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
         _DEPRECATED_PARAMS = {
