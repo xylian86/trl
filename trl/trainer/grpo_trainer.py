@@ -423,6 +423,7 @@ class GRPOTrainer(Trainer):
         self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
         self.use_liger_loss = args.use_liger_loss
+        self._activation_offload = None  # built on first use, after DeepSpeed has chosen its pin backend
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
@@ -1063,6 +1064,36 @@ class GRPOTrainer(Trainer):
             logger.info(f"Released {released_bytes / (1024**3):.2f} GiB of SuperRL optimizer buffers for rollout")
         return released_bytes
 
+    def _activation_offload_context(self):
+        if not self.args.activation_offloading:
+            return nullcontext()
+        if self._activation_offload is None:
+            try:
+                from deepspeed.utils.pin_memory import get_active_native_pinned_memory
+            except ImportError:
+                get_active_native_pinned_memory = None
+            if get_active_native_pinned_memory is not None and get_active_native_pinned_memory() is not None:
+                from deepspeed.runtime.swap_tensor.phase_activation_offload import PhaseActivationOffload
+
+                self._activation_offload = PhaseActivationOffload()
+            else:
+                from ..models.activation_offloading import OffloadActivations
+
+                self._activation_offload = OffloadActivations()
+        return self._activation_offload
+
+    def _end_activation_offload_phase(self):
+        # The policy update is over: return the activation arena's pinned DRAM before rollout.
+        end_phase = getattr(self._activation_offload, "end_phase", None)
+        if end_phase is not None:
+            end_phase()
+
+    def _prepare_activation_offload_phase(self):
+        # Rollout is over: pin the next update's activation arena in the background.
+        prepare_phase = getattr(self._activation_offload, "prepare_phase", None)
+        if prepare_phase is not None:
+            prepare_phase()
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         start_time = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
@@ -1193,6 +1224,7 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        self._end_activation_offload_phase()
 
         prompts = [x["prompt"] for x in inputs]
 
@@ -1488,6 +1520,8 @@ class GRPOTrainer(Trainer):
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+        if mode == "train":
+            self._prepare_activation_offload_phase()
 
         with torch.no_grad():
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
@@ -1767,12 +1801,15 @@ class GRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        if self.use_liger_loss:
-            # Compute the loss using the liger grpo loss
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
-        else:
-            return self._compute_loss(model, inputs)
+        with self._activation_offload_context():
+            if self.use_liger_loss:
+                # Compute the loss using the liger grpo loss
+                unwrapped_model = self.accelerator.unwrap_model(model)
+                return self._forward_redirection(
+                    model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs
+                )
+            else:
+                return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model

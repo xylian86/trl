@@ -229,6 +229,10 @@ class GRPOConfig(TrainingArguments):
         liger_loss_compile (`bool` or `None`, *optional*, defaults to `None`):
             Whether to compile Liger's loss-math subgraph. If unset, compilation is disabled for dynamic generated
             length bucketing and enabled otherwise.
+        activation_offloading (`bool`, *optional*, defaults to `False`):
+            Whether to offload the policy update's saved activations to pinned host memory instead of recomputing
+            them. With DeepSpeed's native pin backend, the host buffers come from one arena per policy update
+            (SuperRL-Pin); otherwise each tensor is pinned by PyTorch. Use it instead of `gradient_checkpointing`.
         vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
             Whether to apply Truncated Importance Sampling (TIS) between vLLM completion logprobs and recomputed
             logprobs. [Your Efficient RL Framework Secretly Brings You Off-Policy RL
@@ -626,6 +630,14 @@ class GRPOConfig(TrainingArguments):
             "help": "Compile Liger loss math. Defaults off for generated-length bucketing and on otherwise."
         },
     )
+    activation_offloading: bool = field(
+        default=False,
+        metadata={
+            "help": "Offload the policy update's saved activations to pinned host memory instead of recomputing "
+            "them. With DeepSpeed's native pin backend the host buffers come from one arena per policy update. "
+            "Use it instead of `gradient_checkpointing`."
+        },
+    )
     vllm_importance_sampling_correction: bool = field(
         default=True,
         metadata={
@@ -720,3 +732,8 @@ class GRPOConfig(TrainingArguments):
 
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
+        if self.activation_offloading and self.gradient_checkpointing:
+            raise ValueError(
+                "activation_offloading replaces gradient_checkpointing; set gradient_checkpointing=False to use it."
+            )
