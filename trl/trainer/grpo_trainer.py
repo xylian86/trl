@@ -19,7 +19,7 @@ import re
 import textwrap
 import time
 from collections import defaultdict, deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -424,6 +424,15 @@ class GRPOTrainer(Trainer):
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
         self.use_liger_loss = args.use_liger_loss
         self._activation_offload = None  # built on first use, after DeepSpeed has chosen its pin backend
+        # SUPERRL_PROFILE_UPDATE=1: GPU time of the training forward passes and of the no-grad old-logps pass,
+        # printed (rank 0) when the next rollout starts.
+        self._profile_update = os.environ.get("SUPERRL_PROFILE_UPDATE") == "1"
+        self._profile_spans = defaultdict(list)
+        self._profile_cpu = defaultdict(float)  # CPU seconds of the same spans
+        # SUPERRL_TORCH_PROFILE=1: torch.profiler tables (rank 0) for the second update's no-grad old-logps pass and
+        # for the forward and backward of its fifth micro-step.
+        self._torch_profile = os.environ.get("SUPERRL_TORCH_PROFILE") == "1"
+        self._torch_profiled = set()
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
@@ -530,6 +539,15 @@ class GRPOTrainer(Trainer):
                     "Compiling Liger loss with generated-length bucketing can trigger shape-guard recompilation."
                 )
 
+            if args.liger_loss_vocab_chunk_size is not None:
+                import liger_kernel.chunked_loss.fused_linear_ppo as liger_ppo
+
+                if not hasattr(liger_ppo, "_SELECTIVE_LOGPROB_VOCAB_CHUNK_SIZE"):
+                    raise ValueError(
+                        "liger_loss_vocab_chunk_size needs liger-kernel's _SELECTIVE_LOGPROB_VOCAB_CHUNK_SIZE, which "
+                        "this liger-kernel version does not have."
+                    )
+                liger_ppo._SELECTIVE_LOGPROB_VOCAB_CHUNK_SIZE = args.liger_loss_vocab_chunk_size
             self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
                 beta=self.beta,
                 compiled=liger_loss_compile,
@@ -539,6 +557,7 @@ class GRPOTrainer(Trainer):
                 use_ref_model=self.beta != 0.0,
                 loss_type=self.loss_type,
                 max_completion_length=self.max_completion_length,
+                chunk_size=args.liger_loss_chunk_size,
             )
 
         # Initialize the metrics
@@ -1082,6 +1101,55 @@ class GRPOTrainer(Trainer):
                 self._activation_offload = OffloadActivations()
         return self._activation_offload
 
+    def _profile_event(self):
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def _report_profile(self):
+        if not (self._profile_update and self._profile_spans):
+            return
+        torch.cuda.synchronize()
+        parts = [
+            f"{name} {sum(a.elapsed_time(b) for a, b in spans) / 1e3:.2f} s"
+            + (f" (CPU {self._profile_cpu[name]:.2f} s)" if name in self._profile_cpu else "")
+            + f" ({len(spans)} calls)"
+            for name, spans in self._profile_spans.items()
+        ]
+        if self.accelerator.is_main_process:
+            print(f"[superrl_profile] update GPU time: {', '.join(parts)}", flush=True)
+        self._profile_spans.clear()
+        self._profile_cpu.clear()
+
+    @contextmanager
+    def _maybe_torch_profile(self, name):
+        """Profile this region with torch.profiler once, in the second update, and print tables on rank 0."""
+        if not self._torch_profile or self.state.global_step != 1 or name in self._torch_profiled:
+            yield
+            return
+        self._torch_profiled.add(name)
+        from torch.profiler import ProfilerActivity, profile
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            yield
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - start
+        if not self.accelerator.is_main_process:
+            return
+        events = prof.key_averages()
+        kernels = [e for e in events if e.device_type == torch.autograd.DeviceType.CUDA]
+        busy = sum(e.self_device_time_total for e in kernels) / 1e6
+        print(f"[superrl_torch_profile] {name}: wall {wall:.2f} s, GPU kernels and copies {busy:.2f} s "
+              f"({busy / wall:.0%} of wall), {sum(e.count for e in kernels)} GPU ops", flush=True)
+        ranges = [e for e in events if e.key.startswith("superrl::")]
+        for e in sorted(ranges, key=lambda e: e.key):
+            print(f"[superrl_torch_profile]   {e.key}: CPU {e.cpu_time_total / 1e6:.3f} s, GPU {e.device_time_total / 1e6:.3f} s, "
+                  f"{e.count} calls", flush=True)
+        print(events.table(sort_by="self_device_time_total", row_limit=25, max_name_column_width=70), flush=True)
+        print(events.table(sort_by="self_cpu_time_total", row_limit=20, max_name_column_width=70), flush=True)
+
     def _end_activation_offload_phase(self):
         # The policy update is over: return the activation arena's pinned DRAM before rollout.
         end_phase = getattr(self._activation_offload, "end_phase", None)
@@ -1096,7 +1164,9 @@ class GRPOTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         start_time = time.perf_counter()
-        output = super().training_step(model, inputs, num_items_in_batch)
+        micro = self._timed_train_microsteps % self.current_gradient_accumulation_steps
+        with self._maybe_torch_profile("training micro-step 5 (forward + backward)") if micro == 4 else nullcontext():
+            output = super().training_step(model, inputs, num_items_in_batch)
         self._current_rl_step_time += time.perf_counter() - start_time
         self._timed_train_microsteps += 1
         if self._timed_train_microsteps % self.current_gradient_accumulation_steps == 0:
@@ -1224,6 +1294,7 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        self._report_profile()
         self._end_activation_offload_phase()
 
         prompts = [x["prompt"] for x in inputs]
@@ -1522,6 +1593,7 @@ class GRPOTrainer(Trainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
         if mode == "train":
             self._prepare_activation_offload_phase()
+        old_logps_start = self._profile_event() if self._profile_update else None
 
         with torch.no_grad():
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
@@ -1535,17 +1607,18 @@ class GRPOTrainer(Trainer):
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    pixel_values=prompt_inputs.get("pixel_values"),
-                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                    image_sizes=prompt_inputs.get("image_sizes"),
-                )
+                with self._maybe_torch_profile("old-logps no-grad pass (all micro-batches)"):
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        pixel_values=prompt_inputs.get("pixel_values"),
+                        image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                        pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                        image_sizes=prompt_inputs.get("image_sizes"),
+                    )
             else:
                 old_per_token_logps = None
 
@@ -1585,6 +1658,9 @@ class GRPOTrainer(Trainer):
                         )
             else:
                 ref_per_token_logps = None
+
+        if old_logps_start is not None:
+            self._profile_spans["old-logps forward"].append((old_logps_start, self._profile_event()))
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -1757,32 +1833,41 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        spans = self._profile_update and self.model.training
+        marks = [(self._profile_event(), time.perf_counter())] if spans else None
+
         # Get the last hidden state of the model
-        last_hidden_state = self._get_last_hidden_state(
-            unwrapped_model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            inputs.get("pixel_values"),
-            inputs.get("image_grid_thw"),
-            inputs.get("pixel_attention_mask"),
-            inputs.get("image_sizes"),
-        )
+        with torch.profiler.record_function("superrl::base_model_forward"):
+            last_hidden_state = self._get_last_hidden_state(
+                unwrapped_model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                inputs.get("pixel_values"),
+                inputs.get("image_grid_thw"),
+                inputs.get("pixel_attention_mask"),
+                inputs.get("image_sizes"),
+            )
+        if spans:
+            marks.append((self._profile_event(), time.perf_counter()))
 
         # Invoke the fused operation through the head module so ZeRO-3's
         # backward pre-hook regathers the weight before Liger returns its full
         # gradient. The gather context handles versions that do not gather on
         # the redirected module pre-hook.
-        loss, metrics = self._lm_head_forward_redirection(
-            unwrapped_model.lm_head,
-            unwrapped_model.lm_head,
-            self._compute_liger_loss_from_hidden,
-            unwrapped_model.lm_head,
-            last_hidden_state,
-            completion_ids,
-            completion_mask,
-            inputs,
-        )
+        with torch.profiler.record_function("superrl::liger_loss"):
+            loss, metrics = self._lm_head_forward_redirection(
+                unwrapped_model.lm_head,
+                unwrapped_model.lm_head,
+                self._compute_liger_loss_from_hidden,
+                unwrapped_model.lm_head,
+                last_hidden_state,
+                completion_ids,
+                completion_mask,
+                inputs,
+            )
+        if spans:
+            marks.append((self._profile_event(), time.perf_counter()))
         # Extract metrics from the liger_grpo_loss output
         # KL divergence is the first metric when beta is non-zero
         mean_kl = metrics[0] if self.beta != 0.0 else None
@@ -1791,7 +1876,13 @@ class GRPOTrainer(Trainer):
         mode = "train" if self.model.training else "eval"
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
-        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+        with torch.profiler.record_function("superrl::metrics_gather"):
+            self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+        if spans:
+            marks.append((self._profile_event(), time.perf_counter()))
+            for name, (a, b) in zip(("  base model forward", "  liger loss", "  metrics gather"), zip(marks, marks[1:])):
+                self._profile_spans[name].append((a[0], b[0]))
+                self._profile_cpu[name] += b[1] - a[1]
         # DAPO's global token count already normalizes the full accumulation
         # window. Other loss types are normalized per micro-batch.
         normalizer = 1 if self.loss_type == "dapo" else self.current_gradient_accumulation_steps
@@ -1801,15 +1892,19 @@ class GRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+        start = self._profile_event() if self._profile_update and model.training else None
         with self._activation_offload_context():
             if self.use_liger_loss:
                 # Compute the loss using the liger grpo loss
                 unwrapped_model = self.accelerator.unwrap_model(model)
-                return self._forward_redirection(
+                loss = self._forward_redirection(
                     model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs
                 )
             else:
-                return self._compute_loss(model, inputs)
+                loss = self._compute_loss(model, inputs)
+        if start is not None:
+            self._profile_spans["training forward"].append((start, self._profile_event()))
+        return loss
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model

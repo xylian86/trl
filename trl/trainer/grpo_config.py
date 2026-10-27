@@ -229,6 +229,13 @@ class GRPOConfig(TrainingArguments):
         liger_loss_compile (`bool` or `None`, *optional*, defaults to `None`):
             Whether to compile Liger's loss-math subgraph. If unset, compilation is disabled for dynamic generated
             length bucketing and enabled otherwise.
+        liger_loss_chunk_size (`int`, *optional*, defaults to `1`):
+            Completions per chunk in Liger's fused GRPO loss. Each chunk runs a Python loop over vocabulary chunks,
+            so one completion per chunk launches many small kernels; a few per chunk cut that overhead.
+        liger_loss_vocab_chunk_size (`int` or `None`, *optional*, defaults to `None`):
+            Vocabulary chunk of Liger's selective log-probabilities (liger-kernel keeps it in the module constant
+            `_SELECTIVE_LOGPROB_VOCAB_CHUNK_SIZE`, 4096 in 0.8.1, which this overrides process-wide). `None` keeps
+            Liger's value. Its backward runs FP32 matmuls, so also consider `tf32=True`.
         activation_offloading (`bool`, *optional*, defaults to `False`):
             Whether to offload the policy update's saved activations to pinned host memory instead of recomputing
             them. With DeepSpeed's native pin backend, the host buffers come from one arena per policy update
@@ -630,6 +637,17 @@ class GRPOConfig(TrainingArguments):
             "help": "Compile Liger loss math. Defaults off for generated-length bucketing and on otherwise."
         },
     )
+    liger_loss_chunk_size: int = field(
+        default=1,
+        metadata={"help": "Completions per chunk in Liger's fused GRPO loss."},
+    )
+    liger_loss_vocab_chunk_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Vocabulary chunk of Liger's selective log-probabilities (overrides liger-kernel's module constant "
+            "_SELECTIVE_LOGPROB_VOCAB_CHUNK_SIZE); None keeps Liger's value."
+        },
+    )
     activation_offloading: bool = field(
         default=False,
         metadata={
@@ -732,6 +750,11 @@ class GRPOConfig(TrainingArguments):
 
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
+        if self.liger_loss_chunk_size < 1:
+            raise ValueError(f"liger_loss_chunk_size must be at least 1, got {self.liger_loss_chunk_size}")
+        if self.liger_loss_vocab_chunk_size is not None and self.liger_loss_vocab_chunk_size < 1:
+            raise ValueError(f"liger_loss_vocab_chunk_size must be positive, got {self.liger_loss_vocab_chunk_size}")
 
         if self.activation_offloading and self.gradient_checkpointing:
             raise ValueError(
