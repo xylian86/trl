@@ -1075,6 +1075,10 @@ class GRPOTrainer(Trainer):
             self.llm.reset_prefix_cache()
 
     def _release_superrl_optimizer_buffers_for_rollout(self):
+        # SUPERRL_KEEP_OPTIMIZER_BUFFERS=1 keeps SuperRL-IO's device swap buffers through rollout: no re-pin when the
+        # next update starts, but vLLM must leave room for them (lower vllm_gpu_memory_utilization).
+        if os.environ.get("SUPERRL_KEEP_OPTIMIZER_BUFFERS") == "1":
+            return 0
         release_fn = getattr(self.model_wrapped, "release_superrl_optimizer_buffers", None)
         if release_fn is None:
             return 0
