@@ -644,7 +644,7 @@ class GRPOTrainer(Trainer):
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
                 )
                 if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=1)
+                    self.llm.sleep(level=self._vllm_sleep_level())
             else:
                 raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
 
@@ -1074,6 +1074,13 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    @staticmethod
+    def _vllm_sleep_level():
+        # SUPERRL_VLLM_SLEEP_LEVEL=2 puts the colocated vLLM engine into level-2 sleep: its weights are discarded
+        # instead of copied to host memory (one bf16 copy of the model) and are reloaded from the policy at every
+        # wake-up. Level 1, the default, keeps the host copy.
+        return int(os.environ.get("SUPERRL_VLLM_SLEEP_LEVEL", "1"))
+
     def _release_superrl_optimizer_buffers_for_rollout(self):
         # SUPERRL_KEEP_OPTIMIZER_BUFFERS=1 keeps SuperRL-IO's device swap buffers through rollout: no re-pin when the
         # next update starts, but vLLM must leave room for them (lower vllm_gpu_memory_utilization).
@@ -1383,8 +1390,10 @@ class GRPOTrainer(Trainer):
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
                 self.llm.wake_up()
 
-            # First, update the vLLM weights if needed
-            if self.state.global_step != self._last_loaded_step:
+            # First, update the vLLM weights if needed (after every level-2 sleep, which discards them)
+            discarded = self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode and \
+                self._vllm_sleep_level() == 2
+            if self.state.global_step != self._last_loaded_step or discarded:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
@@ -1504,7 +1513,7 @@ class GRPOTrainer(Trainer):
                     all_logprobs = all_logprobs[tp_slice]
 
                 if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=1)
+                    self.llm.sleep(level=self._vllm_sleep_level())
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
